@@ -1257,6 +1257,317 @@
     );
 
     // =======================================================================
+    // Config: TEMPLATE_DELIMITERS
+    // Custom literal open/close markers (e.g. Jinja/Liquid {% ... %}) are
+    // stripped on the same three paths as the built-in markers: text nodes,
+    // attribute values and <template> content. Without the option, the
+    // built-in behavior is byte-for-byte unchanged.
+    // =======================================================================
+
+    QUnit.module('Config — TEMPLATE_DELIMITERS');
+
+    const JINJA_DELIMITERS = [{ open: '{%', close: '%}' }];
+
+    // Serializers differ across jsdom / happy-dom / browsers (a single
+    // child's wrapper tag or an attribute scrubbed to whitespace may be
+    // dropped). These assertions compare the security-relevant outcome —
+    // surviving marker text and normalized text content — via a parsed
+    // container, so they hold in every environment.
+    const parseOutput = function (html) {
+      const container = document.createElement('div');
+      container.innerHTML = html;
+      return container;
+    };
+    const assertNoMarkers = function (assert, html, markers, message) {
+      const parsedText = parseOutput(html).textContent;
+      for (const marker of markers) {
+        assert.notOk(
+          html.includes(marker),
+          message + ' — marker ' + marker + ' survives in: ' + html
+        );
+        assert.notOk(
+          parsedText.includes(marker),
+          message + ' — marker ' + marker + ' survives in parsed text'
+        );
+      }
+    };
+
+    QUnit.test(
+      'strips custom delimiters from text nodes alongside built-in markers',
+      (assert) => {
+        const jinja = DOMPurify.sanitize(
+          '<a>{% if admin %}pwn{% endif %}</a>',
+          {
+            SAFE_FOR_TEMPLATES: true,
+            TEMPLATE_DELIMITERS: JINJA_DELIMITERS,
+          }
+        );
+        assertNoMarkers(assert, jinja, ['{%', '%}'], 'jinja text path');
+        assert.equal(parseOutput(jinja).textContent, ' ');
+
+        // Built-in mustache and template-literal markers are still stripped
+        // in the same run: custom pairs extend, never replace, the set.
+        const mixed = DOMPurify.sanitize(
+          '<a>{% if x %}on{% endif %} {{ user.name }} ${2}</a>',
+          {
+            SAFE_FOR_TEMPLATES: true,
+            TEMPLATE_DELIMITERS: JINJA_DELIMITERS,
+          }
+        );
+        assertNoMarkers(
+          assert,
+          mixed,
+          ['{%', '%}', '{{', '}}', '${'],
+          'mixed built-in plus custom markers'
+        );
+        // The ERB pair is covered with entity-encoded angle brackets, the
+        // shape a serializer actually emits and the one the post-serialize
+        // probe guards (a raw '<%' is parsed as a bogus tag by some runtimes,
+        // independent of this feature).
+        const erb = DOMPurify.sanitize('<a>x &lt;% alert(1) %&gt; y</a>', {
+          SAFE_FOR_TEMPLATES: true,
+          TEMPLATE_DELIMITERS: JINJA_DELIMITERS,
+        });
+        assertNoMarkers(
+          assert,
+          erb,
+          ['&lt;%', '%&gt;', '<%', '%>'],
+          'built-in ERB marker'
+        );
+      }
+    );
+
+    QUnit.test(
+      'strips custom delimiters from attribute values on the attribute path',
+      (assert) => {
+        const cfg = {
+          SAFE_FOR_TEMPLATES: true,
+          TEMPLATE_DELIMITERS: JINJA_DELIMITERS,
+        };
+        // The marker never survives in the serialized attribute.
+        assertNoMarkers(
+          assert,
+          DOMPurify.sanitize('<a title="{% alert(1) %}">x</a>', cfg),
+          ['{%', '%}'],
+          'attribute value'
+        );
+        // Greedy close-marker alternative: a stray close marker scrubs the
+        // whole href, so no javascript: URL remains (mirrors the built-in
+        // }}javascript: bypass defense).
+        const strayClose = DOMPurify.sanitize(
+          '<a href="%}javascript:alert(1)">x</a>',
+          cfg
+        );
+        assertNoMarkers(
+          assert,
+          strayClose,
+          ['%}', 'javascript:'],
+          'stray close href'
+        );
+        assert.notOk(
+          parseOutput(strayClose).querySelector('a[href]'),
+          'the href must be removed entirely'
+        );
+        // An unterminated open marker scrubs to the end of the value.
+        const unterminated = DOMPurify.sanitize(
+          '<a href="{% javascript:alert(1)">x</a>',
+          cfg
+        );
+        assertNoMarkers(
+          assert,
+          unterminated,
+          ['{%', 'javascript:'],
+          'unterminated open href'
+        );
+      }
+    );
+
+    QUnit.test('strips custom delimiters inside template content', (assert) => {
+      const result = DOMPurify.sanitize(
+        '<template><b>{% danger %}</b></template>',
+        {
+          SAFE_FOR_TEMPLATES: true,
+          TEMPLATE_DELIMITERS: JINJA_DELIMITERS,
+        }
+      );
+      assertNoMarkers(assert, result, ['{%', '%}'], 'template content');
+    });
+
+    QUnit.test(
+      'greedy semantics leave no orphaned open or close markers',
+      (assert) => {
+        const cfg = {
+          SAFE_FOR_TEMPLATES: true,
+          TEMPLATE_DELIMITERS: [{ open: '[[', close: ']]' }],
+        };
+        // Each case asserts both the normalized text and that neither
+        // marker survives, which is the actual greedy-scrub guarantee.
+        const greedyCases = [
+          ['<a>a[[x]]b</a>', ' b'], // balanced pair
+          ['<a>a[[b[[c]]d</a>', ' d'], // nested openers swallow to the close
+          ['<a>a[[x b</a>', 'a '], // lone opener swallows the remainder
+          ['<a>a x]]b</a>', ' b'], // lone closer swallows everything before
+        ];
+        for (const [input, expectedText] of greedyCases) {
+          const out = DOMPurify.sanitize(input, cfg);
+          assertNoMarkers(assert, out, ['[[', ']]'], input);
+          assert.equal(
+            parseOutput(out).textContent,
+            expectedText,
+            'normalized text for ' + input
+          );
+        }
+
+        // Serialized output carries neither raw nor entity-encoded Jinja
+        // markers (the ERB-style {% / %} pair also gets an encoded probe).
+        const clean = DOMPurify.sanitize('<p>x{% y %}z &lt;% q %&gt;</p>', {
+          SAFE_FOR_TEMPLATES: true,
+          TEMPLATE_DELIMITERS: JINJA_DELIMITERS,
+        });
+        assertNoMarkers(
+          assert,
+          clean,
+          ['{%', '%}', '&lt;%', '%&gt;'],
+          'entity-encoded markers'
+        );
+      }
+    );
+
+    QUnit.test(
+      'custom markers spanning removed subtrees are caught after normalize',
+      (assert) => {
+        // A removed separating element can leave the two halves of a custom
+        // marker in adjacent text nodes; the post-walk normalize()+rescrub
+        // must rejoin and strip them. Uses a text-node layout built via the
+        // DOM API so the assertion does not depend on how a parser
+        // serializes the angle-bracket markers. Environments whose IN_PLACE
+        // forbids sanitizing this root skip the in-place branch and rely on
+        // the string-path coverage above.
+        const dirty = document.createElement('div');
+        dirty.appendChild(document.createTextNode('{'));
+        dirty.appendChild(document.createElement('object'));
+        dirty.appendChild(
+          document.createTextNode('%constructor.constructor("alert(1)")()%')
+        );
+        dirty.appendChild(document.createElement('object'));
+        dirty.appendChild(document.createTextNode('}'));
+
+        let inPlaceWorked = true;
+        try {
+          DOMPurify.sanitize(dirty, {
+            SAFE_FOR_TEMPLATES: true,
+            TEMPLATE_DELIMITERS: JINJA_DELIMITERS,
+            IN_PLACE: true,
+          });
+        } catch {
+          // Some runtimes (e.g. happy-dom) refuse in-place sanitization of
+          // this root; the marker-stripping guarantee is still covered by
+          // the string-path tests in this module.
+          inPlaceWorked = false;
+        }
+
+        if (inPlaceWorked) {
+          assert.notOk(
+            /{%[\s\S]*%}/.test(dirty.innerHTML),
+            'joined custom expression should be scrubbed, got: ' +
+              dirty.innerHTML
+          );
+          assert.notOk(/constructor/.test(dirty.innerHTML));
+        } else {
+          assert.ok(true, 'IN_PLACE unsupported for this root in the runtime');
+        }
+      }
+    );
+
+    QUnit.test(
+      'unconfigured runs keep the three built-in delimiters unchanged',
+      (assert) => {
+        // Compare marker-free outcomes rather than wrapper serialization.
+        const cases = [
+          '<a>123{{456}}<b><style><% alert(1) %></style>456</b></a>',
+          '<a class="{{999-333}}"></a>',
+          '<a href="{{}}javascript:alert(1)">x</a>',
+          '<b>${evil}</b>',
+        ];
+        const builtInMarkers = ['{{', '}}', '<%', '%>', '${'];
+        for (const input of cases) {
+          const withoutOption = DOMPurify.sanitize(input, {
+            SAFE_FOR_TEMPLATES: true,
+          });
+          // An empty marker list is an explicit no-op for the custom set:
+          // output must match the unconfigured run exactly.
+          const withEmptyList = DOMPurify.sanitize(input, {
+            SAFE_FOR_TEMPLATES: true,
+            TEMPLATE_DELIMITERS: [],
+          });
+          assert.equal(withEmptyList, withoutOption);
+          assertNoMarkers(
+            assert,
+            withoutOption,
+            builtInMarkers,
+            'built-in markers stripped for ' + input
+          );
+        }
+
+        // Without SAFE_FOR_TEMPLATES the option has no effect at all.
+        const untouched = DOMPurify.sanitize('<a>{% keep %}</a>', {
+          TEMPLATE_DELIMITERS: JINJA_DELIMITERS,
+        });
+        assert.equal(
+          parseOutput(untouched).textContent,
+          '{% keep %}',
+          'custom markers untouched when SAFE_FOR_TEMPLATES is off'
+        );
+      }
+    );
+
+    QUnit.test(
+      'custom markers with regex metacharacters are matched literally',
+      (assert) => {
+        const cfg = {
+          SAFE_FOR_TEMPLATES: true,
+          TEMPLATE_DELIMITERS: [{ open: 'a.b', close: 'b+?' }],
+        };
+        const literalCases = [
+          ['<a>xa.b mid b+?z</a>', ' z'], // balanced metacharacter pair
+          ['<a>xaXb mid b+?z</a>', ' z'], // dot is literal, aXb is no opener
+          ['<a>xa.b mid bX?z</a>', 'x '], // plus is literal, bX? no closer
+          ['<a>aXb mid bX?z</a>', 'aXb mid bX?z'], // neither marker present
+        ];
+        for (const [input, expectedText] of literalCases) {
+          const out = DOMPurify.sanitize(input, cfg);
+          assert.equal(
+            parseOutput(out).textContent,
+            expectedText,
+            'literal matching for ' + input
+          );
+        }
+      }
+    );
+
+    QUnit.test('malformed TEMPLATE_DELIMITERS throw a TypeError', (assert) => {
+      const invalidConfigs = [
+        { TEMPLATE_DELIMITERS: {} },
+        { TEMPLATE_DELIMITERS: ['{%'] },
+        { TEMPLATE_DELIMITERS: [{ open: '{%' }] },
+        { TEMPLATE_DELIMITERS: [{ open: '', close: '%}' }] },
+        { TEMPLATE_DELIMITERS: [{ open: 1, close: 2 }] },
+        { TEMPLATE_DELIMITERS: [{ open: '{%', close: null }] },
+      ];
+      for (const option of invalidConfigs) {
+        assert.throws(
+          () =>
+            DOMPurify.sanitize('<a>x</a>', {
+              SAFE_FOR_TEMPLATES: true,
+              ...option,
+            }),
+          TypeError,
+          JSON.stringify(option) + ' must be rejected'
+        );
+      }
+    });
+
+    // =======================================================================
     // Config: SANITIZE_DOM
     // =======================================================================
 

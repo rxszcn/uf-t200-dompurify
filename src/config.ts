@@ -193,6 +193,18 @@ export interface Config {
   SAFE_FOR_TEMPLATES?: boolean | undefined;
 
   /**
+   * Additional literal template delimiter pairs stripped when
+   * `SAFE_FOR_TEMPLATES` is enabled. The built-in markers (`{{ ... }}`,
+   * `${ ... }` and `<% ... %>`) are always still stripped; custom pairs
+   * extend, never replace, them. Each pair must provide a non-empty literal
+   * `open` and `close` marker, e.g. `{ open: '{%', close: '%}' }` for
+   * Jinja/Liquid statements. Markers are treated as literal text, not
+   * regular expressions. Malformed entries throw a `TypeError` rather than
+   * being silently ignored.
+   */
+  TEMPLATE_DELIMITERS?: TemplateDelimiterPair[] | undefined;
+
+  /**
    * Change how e.g. comments containing risky HTML characters are treated.
    * Be very careful, this setting should only be set to `false` if you really only handle
    * HTML and nothing else, no SVG, MathML or the like.
@@ -229,6 +241,22 @@ export interface Config {
    * Return entire document including <html> tags (default is false).
    */
   WHOLE_DOCUMENT?: boolean | undefined;
+}
+
+/**
+ * A literal template delimiter pair for {@link Config.TEMPLATE_DELIMITERS}.
+ * Both markers are matched verbatim as literal strings.
+ */
+export interface TemplateDelimiterPair {
+  /**
+   * Literal opening marker, e.g. `{%` for a Jinja/Liquid statement.
+   */
+  open: string;
+
+  /**
+   * Literal closing marker, e.g. `%}` for a Jinja/Liquid statement.
+   */
+  close: string;
 }
 
 /**

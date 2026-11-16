@@ -225,6 +225,16 @@ Before you widen the allow-list (`ADD_TAGS`, `ADD_ATTR`, `CUSTOM_ELEMENT_HANDLIN
 // and neither are values a hook keeps via forceKeepAttr or writes itself.
 const clean = DOMPurify.sanitize(dirty, { SAFE_FOR_TEMPLATES: true });
 
+// additionally strip custom literal marker pairs (e.g. Jinja/Liquid {% ... %}).
+// pairs extend the built-in {{ ... }}, ${ ... } and <% ... %> markers, they
+// never replace them. Markers are literal strings (regex metacharacters are
+// escaped), and are scrubbed on the same three paths: text, attribute values
+// and <template> content. Malformed pairs throw a TypeError.
+const clean = DOMPurify.sanitize(dirty, {
+  SAFE_FOR_TEMPLATES: true,
+  TEMPLATE_DELIMITERS: [{ open: '{%', close: '%}' }],
+});
+
 // change how e.g. comments containing risky HTML characters are treated.
 // be very careful, this setting should only be set to `false` if you really only handle
 // HTML and nothing else, no SVG, MathML or the like.

@@ -1,8 +1,16 @@
-import type { Config, UseProfilesConfig } from './config';
+import type {
+  Config,
+  TemplateDelimiterPair,
+  UseProfilesConfig,
+} from './config';
 import type { DOMPurify, HooksMap, HookFunction, WindowLike } from './types';
 import * as TAGS from './tags.js';
 import * as ATTRS from './attrs.js';
 import * as EXPRESSIONS from './regexp.js';
+import {
+  buildTemplateDelimiterExpr,
+  buildTemplateMarkerProbe,
+} from './regexp.js';
 import {
   addToSet,
   clone,
@@ -195,6 +203,40 @@ const _resolveObjectOption = function <T extends Record<string, any>>(
   return value && typeof value === 'object' ? clone(value as T) : fallback;
 };
 
+/**
+ * Validates one TEMPLATE_DELIMITERS entry. Markers must be literal,
+ * non-empty strings; anything else is a configuration error and throws
+ * instead of being silently ignored.
+ *
+ * @param entry the candidate entry from the cloned config
+ * @param index its position, for an actionable error message
+ * @returns the validated literal pair
+ */
+const _validateTemplateDelimiter = function (
+  entry: unknown,
+  index: number
+): TemplateDelimiterPair {
+  if (!entry || typeof entry !== 'object') {
+    throw typeErrorCreate(
+      `TEMPLATE_DELIMITERS[${index}] must be an object with string 'open' and 'close' markers`
+    );
+  }
+
+  const { open, close } = entry as TemplateDelimiterPair;
+  if (
+    typeof open !== 'string' ||
+    typeof close !== 'string' ||
+    !open ||
+    !close
+  ) {
+    throw typeErrorCreate(
+      `TEMPLATE_DELIMITERS[${index}] requires non-empty literal string 'open' and 'close' markers`
+    );
+  }
+
+  return { open, close };
+};
+
 function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   const DOMPurify: DOMPurify = (root: WindowLike) => createDOMPurify(root);
 
@@ -374,9 +416,6 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     implementation.createHTMLDocument !== undefined;
 
   const {
-    MUSTACHE_EXPR,
-    ERB_EXPR,
-    TMPLIT_EXPR,
     DATA_ATTR,
     ARIA_ATTR,
     IS_SCRIPT_OR_DATA,
@@ -459,6 +498,18 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
    * This means, DOMPurify removes data attributes, mustaches and ERB
    */
   let SAFE_FOR_TEMPLATES = false;
+
+  /* Scrub expressions for the built-in delimiters plus any caller-supplied
+   * TEMPLATE_DELIMITERS pairs. The built-in three always run first and in
+   * their historical order; custom expressions are appended after them.
+   * TEMPLATE_MARKER_PROBE is the serialized-output probe, the built-in
+   * TMPL_MARKER_SERIALIZED plus encoded forms of the custom markers. */
+  let TEMPLATE_EXPRESSIONS: RegExp[] = [
+    EXPRESSIONS.MUSTACHE_EXPR,
+    EXPRESSIONS.ERB_EXPR,
+    EXPRESSIONS.TMPLIT_EXPR,
+  ];
+  let TEMPLATE_MARKER_PROBE: RegExp = EXPRESSIONS.TMPL_MARKER_SERIALIZED;
 
   /* Output should be safe even for XML used within HTML and alike.
    * This means, DOMPurify removes comments when containing risky content.
@@ -734,6 +785,44 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     ALLOW_UNKNOWN_PROTOCOLS = cfg.ALLOW_UNKNOWN_PROTOCOLS || false; // Default false
     ALLOW_SELF_CLOSE_IN_ATTR = cfg.ALLOW_SELF_CLOSE_IN_ATTR !== false; // Default true
     SAFE_FOR_TEMPLATES = cfg.SAFE_FOR_TEMPLATES || false; // Default false
+
+    // Build the scrub expression list. The built-in three keep their
+    // exact regexes and historical order, so an unconfigured run behaves
+    // byte-for-byte as before; validated custom pairs are appended.
+    TEMPLATE_EXPRESSIONS = [
+      EXPRESSIONS.MUSTACHE_EXPR,
+      EXPRESSIONS.ERB_EXPR,
+      EXPRESSIONS.TMPLIT_EXPR,
+    ];
+    TEMPLATE_MARKER_PROBE = EXPRESSIONS.TMPL_MARKER_SERIALIZED;
+
+    if (
+      objectHasOwnProperty(cfg, 'TEMPLATE_DELIMITERS') &&
+      cfg.TEMPLATE_DELIMITERS !== undefined
+    ) {
+      if (!arrayIsArray(cfg.TEMPLATE_DELIMITERS)) {
+        throw typeErrorCreate(
+          'TEMPLATE_DELIMITERS must be an array of {open, close} marker pairs'
+        );
+      }
+
+      const customDelimiters: TemplateDelimiterPair[] = [];
+      arrayForEach(cfg.TEMPLATE_DELIMITERS, (entry, index) => {
+        const delimiter = _validateTemplateDelimiter(entry, index);
+        customDelimiters.push(delimiter);
+        TEMPLATE_EXPRESSIONS.push(buildTemplateDelimiterExpr(delimiter));
+      });
+
+      const customProbe = buildTemplateMarkerProbe(customDelimiters);
+      if (customProbe) {
+        TEMPLATE_MARKER_PROBE = seal(
+          new RegExp(
+            `${EXPRESSIONS.TMPL_MARKER_SERIALIZED.source}|${customProbe.source}`
+          )
+        );
+      }
+    }
+
     SAFE_FOR_XML = cfg.SAFE_FOR_XML !== false; // Default true
     WHOLE_DOCUMENT = cfg.WHOLE_DOCUMENT || false; // Default false
     RETURN_DOM = cfg.RETURN_DOM || false; // Default false
@@ -1678,16 +1767,18 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
 
   /**
    * Replace template expression syntax (mustache, ERB, template
-   * literal) with a space; shared by all SAFE_FOR_TEMPLATES scrub
-   * sites. Order matters: mustache, then ERB, then template literal.
+   * literal, and any configured TEMPLATE_DELIMITERS pairs) with a space;
+   * shared by all SAFE_FOR_TEMPLATES scrub sites. The built-in three run
+   * first in their historical order, custom pairs follow, and each
+   * expression uses the same greedy semantics as MUSTACHE_EXPR.
    *
    * @param value the string to scrub
    * @returns the scrubbed string
    */
   const _stripTemplateExpressions = function (value: string): string {
-    value = stringReplace(value, MUSTACHE_EXPR, ' ');
-    value = stringReplace(value, ERB_EXPR, ' ');
-    value = stringReplace(value, TMPLIT_EXPR, ' ');
+    arrayForEach(TEMPLATE_EXPRESSIONS, (expression: RegExp) => {
+      value = stringReplace(value, expression, ' ');
+    });
     return value;
   };
 
@@ -2869,7 +2960,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
        content was already scrubbed by _sanitizeShadowDOM. */
     if (
       SAFE_FOR_TEMPLATES &&
-      regExpTest(EXPRESSIONS.TMPL_MARKER_SERIALIZED, serializedHTML)
+      regExpTest(TEMPLATE_MARKER_PROBE, serializedHTML)
     ) {
       _scrubOwnCharacterData(body);
       serializedHTML = serialize();

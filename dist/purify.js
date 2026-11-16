@@ -968,6 +968,51 @@
 	const ERB_EXPR = seal(/<%[\w\W]*|^[\w\W]*%>/g);
 	const TMPLIT_EXPR = seal(/\${[\w\W]*/g);
 	const TMPL_MARKER_SERIALIZED = seal(/{{|}}|\${|<%|%>|&lt;%|%&gt;/);
+	/**
+	* Escapes the regular-expression metacharacters of a literal string so it
+	* can be embedded verbatim into a RegExp source.
+	*
+	* @param literal the literal marker to escape
+	* @returns the escaped RegExp source fragment
+	*/
+	const escapeRegExp = function escapeRegExp(literal) {
+		return literal.replaceAll(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+	};
+	/**
+	* Builds the greedy scrub expression for one caller-supplied template
+	* delimiter pair. The two alternatives mirror MUSTACHE_EXPR/ERB_EXPR: an
+	* opening marker swallows the rest of the value and a closing marker
+	* swallows everything before it, so an unbalanced marker never leaves an
+	* orphaned open or close token behind.
+	*
+	* @param delimiter the literal open/close marker pair
+	* @returns a sealed, globally matching scrub expression
+	*/
+	const buildTemplateDelimiterExpr = function buildTemplateDelimiterExpr(delimiter) {
+		return seal(new RegExp("".concat(escapeRegExp(delimiter.open), "[\\w\\W]*|^[\\w\\W]*").concat(escapeRegExp(delimiter.close)), "g"));
+	};
+	/**
+	* Builds the serialized-output probe for caller-supplied delimiter pairs.
+	* Besides the raw markers it includes the entity-encoded shapes a serializer
+	* can emit (`<`/`>` and `&` are escaped), matching the coverage the built-in
+	* ERB probe provides for `<%`/`%>`.
+	*
+	* @param delimiters the literal open/close marker pairs
+	* @returns a sealed probe without flags, or null when there are no markers
+	*/
+	const buildTemplateMarkerProbe = function buildTemplateMarkerProbe(delimiters) {
+		const fragments = [];
+		const collect = function collect(marker) {
+			const encoded = marker.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+			fragments.push(escapeRegExp(marker));
+			if (encoded !== marker) fragments.push(escapeRegExp(encoded));
+		};
+		for (const delimiter of delimiters) {
+			collect(delimiter.open);
+			collect(delimiter.close);
+		}
+		return fragments.length > 0 ? seal(new RegExp(fragments.join("|"))) : null;
+	};
 	const DATA_ATTR = seal(/^data-[\-\w.\u00B7-\uFFFF]+$/);
 	const ARIA_ATTR = seal(/^aria-[\-\w]+$/);
 	const IS_ALLOWED_URI = seal(/^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i);
@@ -1067,6 +1112,24 @@
 		const value = objectHasOwnProperty(cfg, key) ? cfg[key] : void 0;
 		return value && typeof value === "object" ? clone(value) : fallback;
 	};
+	/**
+	* Validates one TEMPLATE_DELIMITERS entry. Markers must be literal,
+	* non-empty strings; anything else is a configuration error and throws
+	* instead of being silently ignored.
+	*
+	* @param entry the candidate entry from the cloned config
+	* @param index its position, for an actionable error message
+	* @returns the validated literal pair
+	*/
+	const _validateTemplateDelimiter = function _validateTemplateDelimiter(entry, index) {
+		if (!entry || typeof entry !== "object") throw typeErrorCreate("TEMPLATE_DELIMITERS[".concat(index, "] must be an object with string 'open' and 'close' markers"));
+		const _ref = entry, open = _ref.open, close = _ref.close;
+		if (typeof open !== "string" || typeof close !== "string" || !open || !close) throw typeErrorCreate("TEMPLATE_DELIMITERS[".concat(index, "] requires non-empty literal string 'open' and 'close' markers"));
+		return {
+			open,
+			close
+		};
+	};
 	function createDOMPurify() {
 		let window = arguments.length > 0 && arguments[0] !== void 0 ? arguments[0] : getGlobal();
 		const DOMPurify = (root) => createDOMPurify(root);
@@ -1149,7 +1212,7 @@
 		* Expose whether this browser supports running the full DOMPurify.
 		*/
 		DOMPurify.isSupported = typeof entries === "function" && typeof getParentNode === "function" && implementation && implementation.createHTMLDocument !== void 0;
-		const MUSTACHE_EXPR$1 = MUSTACHE_EXPR, ERB_EXPR$1 = ERB_EXPR, TMPLIT_EXPR$1 = TMPLIT_EXPR, DATA_ATTR$1 = DATA_ATTR, ARIA_ATTR$1 = ARIA_ATTR, IS_SCRIPT_OR_DATA$1 = IS_SCRIPT_OR_DATA, ATTR_WHITESPACE$1 = ATTR_WHITESPACE, CUSTOM_ELEMENT$1 = CUSTOM_ELEMENT;
+		const DATA_ATTR$1 = DATA_ATTR, ARIA_ATTR$1 = ARIA_ATTR, IS_SCRIPT_OR_DATA$1 = IS_SCRIPT_OR_DATA, ATTR_WHITESPACE$1 = ATTR_WHITESPACE, CUSTOM_ELEMENT$1 = CUSTOM_ELEMENT;
 		let IS_ALLOWED_URI$1 = IS_ALLOWED_URI;
 		/**
 		* We consider the elements and attributes below to be safe. Ideally
@@ -1192,6 +1255,12 @@
 		let ALLOW_UNKNOWN_PROTOCOLS = false;
 		let ALLOW_SELF_CLOSE_IN_ATTR = true;
 		let SAFE_FOR_TEMPLATES = false;
+		let TEMPLATE_EXPRESSIONS = [
+			MUSTACHE_EXPR,
+			ERB_EXPR,
+			TMPLIT_EXPR
+		];
+		let TEMPLATE_MARKER_PROBE = TMPL_MARKER_SERIALIZED;
 		let SAFE_FOR_XML = true;
 		let WHOLE_DOCUMENT = false;
 		let SET_CONFIG = false;
@@ -1332,6 +1401,23 @@
 			ALLOW_UNKNOWN_PROTOCOLS = cfg.ALLOW_UNKNOWN_PROTOCOLS || false;
 			ALLOW_SELF_CLOSE_IN_ATTR = cfg.ALLOW_SELF_CLOSE_IN_ATTR !== false;
 			SAFE_FOR_TEMPLATES = cfg.SAFE_FOR_TEMPLATES || false;
+			TEMPLATE_EXPRESSIONS = [
+				MUSTACHE_EXPR,
+				ERB_EXPR,
+				TMPLIT_EXPR
+			];
+			TEMPLATE_MARKER_PROBE = TMPL_MARKER_SERIALIZED;
+			if (objectHasOwnProperty(cfg, "TEMPLATE_DELIMITERS") && cfg.TEMPLATE_DELIMITERS !== void 0) {
+				if (!arrayIsArray(cfg.TEMPLATE_DELIMITERS)) throw typeErrorCreate("TEMPLATE_DELIMITERS must be an array of {open, close} marker pairs");
+				const customDelimiters = [];
+				arrayForEach(cfg.TEMPLATE_DELIMITERS, (entry, index) => {
+					const delimiter = _validateTemplateDelimiter(entry, index);
+					customDelimiters.push(delimiter);
+					TEMPLATE_EXPRESSIONS.push(buildTemplateDelimiterExpr(delimiter));
+				});
+				const customProbe = buildTemplateMarkerProbe(customDelimiters);
+				if (customProbe) TEMPLATE_MARKER_PROBE = seal(new RegExp("".concat(TMPL_MARKER_SERIALIZED.source, "|").concat(customProbe.source)));
+			}
 			SAFE_FOR_XML = cfg.SAFE_FOR_XML !== false;
 			WHOLE_DOCUMENT = cfg.WHOLE_DOCUMENT || false;
 			RETURN_DOM = cfg.RETURN_DOM || false;
@@ -1832,16 +1918,18 @@
 		};
 		/**
 		* Replace template expression syntax (mustache, ERB, template
-		* literal) with a space; shared by all SAFE_FOR_TEMPLATES scrub
-		* sites. Order matters: mustache, then ERB, then template literal.
+		* literal, and any configured TEMPLATE_DELIMITERS pairs) with a space;
+		* shared by all SAFE_FOR_TEMPLATES scrub sites. The built-in three run
+		* first in their historical order, custom pairs follow, and each
+		* expression uses the same greedy semantics as MUSTACHE_EXPR.
 		*
 		* @param value the string to scrub
 		* @returns the scrubbed string
 		*/
 		const _stripTemplateExpressions = function _stripTemplateExpressions(value) {
-			value = stringReplace(value, MUSTACHE_EXPR$1, " ");
-			value = stringReplace(value, ERB_EXPR$1, " ");
-			value = stringReplace(value, TMPLIT_EXPR$1, " ");
+			arrayForEach(TEMPLATE_EXPRESSIONS, (expression) => {
+				value = stringReplace(value, expression, " ");
+			});
 			return value;
 		};
 		/**
@@ -2401,7 +2489,7 @@
 			}
 			const serialize = () => WHOLE_DOCUMENT ? body.outerHTML : body.innerHTML;
 			let serializedHTML = serialize();
-			if (SAFE_FOR_TEMPLATES && regExpTest(TMPL_MARKER_SERIALIZED, serializedHTML)) {
+			if (SAFE_FOR_TEMPLATES && regExpTest(TEMPLATE_MARKER_PROBE, serializedHTML)) {
 				_scrubOwnCharacterData(body);
 				serializedHTML = serialize();
 			}
